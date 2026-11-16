@@ -36,6 +36,12 @@ export function nextRequestId(): string {
 
 /** Read a request body whole, or null when it exceeds the cap. */
 export function readBody(req: IncomingMessage): Promise<Buffer | null> {
+  // A GET or HEAD with no declared body has nothing to read: resolve at
+  // once instead of waiting a tick for the stream's 'end' event.
+  if ((req.method === 'GET' || req.method === 'HEAD') && req.headers['transfer-encoding'] === undefined) {
+    const length = Number(req.headers['content-length'] ?? 0);
+    if (length === 0) return Promise.resolve(Buffer.alloc(0));
+  }
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -58,22 +64,54 @@ export function readBody(req: IncomingMessage): Promise<Buffer | null> {
   });
 }
 
+/**
+ * Split a request URL into its pathname and query in one pass, without
+ * constructing a URL object (two of those per request was the old cost).
+ * The split follows the URL rules for the inputs this server sees: the
+ * pathname ends at the first '?' or '#', the query is the '?'-part up to
+ * '#', and percent-escapes stay as written (the handlers decode the
+ * segments they need themselves). Anything unusual — a relative target,
+ * a dot segment (which URL resolution would collapse), or a parse failure
+ * — falls back to `new URL`, which is always correct.
+ */
+export function parseRequestUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const raw = req.url ?? '/';
+  let pathEnd = raw.length;
+  const q = raw.indexOf('?');
+  const h = raw.indexOf('#');
+  if (q >= 0 && q < pathEnd) pathEnd = q;
+  if (h >= 0 && h < pathEnd) pathEnd = h;
+  const rawPath = raw.slice(0, pathEnd);
+  const queryString = q >= 0 && (h < 0 || q < h) ? raw.slice(q + 1, h < 0 ? raw.length : h) : '';
+  let path: string;
+  if (
+    rawPath === '' ||
+    !rawPath.startsWith('/') ||
+    rawPath.startsWith('//') ||
+    rawPath.includes('/./') ||
+    rawPath.includes('/../') ||
+    rawPath.endsWith('/.') ||
+    rawPath.endsWith('/..')
+  ) {
+    try {
+      path = new URL(raw, 'http://entry').pathname;
+    } catch {
+      path = '/';
+    }
+  } else {
+    path = rawPath;
+  }
+  return { path, query: queryString === '' ? new URLSearchParams() : new URLSearchParams(queryString) };
+}
+
 /** The pathname of a request URL, or '/' when it does not parse. */
 export function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  return parseRequestUrl(req).path;
 }
 
 /** The query string of a request URL. */
 export function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  return parseRequestUrl(req).query;
 }
 
 /** Whether the request carries the expected bearer token. */
@@ -135,18 +173,26 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** The bearer token the env set, read once: it cannot change during the process. */
+let cachedToken: string | null = null;
+function shopToken(): string {
+  if (cachedToken === null) cachedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return cachedToken;
+}
+
 /** Build the request context: read the body whole, then fill in the fields the handlers need. Returns null when the body exceeds the cap. */
 export async function createCtx(req: IncomingMessage, res: ServerResponse, store: Store): Promise<Ctx | null> {
   const body = await readBody(req);
   if (body === null) return null;
+  const { path, query } = parseRequestUrl(req);
   return {
     store,
-    token: process.env.MAKEFUN_SHOP_TOKEN ?? '',
+    token: shopToken(),
     req,
     res,
     method: req.method ?? 'GET',
-    path: pathOf(req),
-    query: queryOf(req),
+    path,
+    query,
     body,
     requestId: nextRequestId(),
     host: req.headers.host ?? '127.0.0.1',

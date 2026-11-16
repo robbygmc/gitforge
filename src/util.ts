@@ -29,6 +29,28 @@ export function sha1(data: Buffer | Uint8Array): string {
   return createHash('sha1').update(data).digest('hex');
 }
 
+/** SHA-1 over several parts without concatenating them first (avoids a copy of the payload). */
+export function sha1Parts(...parts: readonly (Buffer | Uint8Array | string)[]): string {
+  const hash = createHash('sha1');
+  for (const part of parts) hash.update(part);
+  return hash.digest('hex');
+}
+
+/**
+ * The ISO-8601 timestamp for a creation sequence (EPOCH_SEC + seq seconds).
+ * A pure function of `seq`, so the result is cached: the same seq always
+ * yields the same string, and timestamps are minted thousands of times per
+ * trial (every issue, pull, comment and repo serialization).
+ */
+const isoCache = new Map<number, string>();
+export function isoOfSeq(seq: number): string {
+  const cached = isoCache.get(seq);
+  if (cached !== undefined) return cached;
+  const iso = new Date((EPOCH_SEC + seq) * 1000).toISOString();
+  isoCache.set(seq, iso);
+  return iso;
+}
+
 /** Standard base64 of bytes. */
 export function b64encode(data: Buffer | Uint8Array): string {
   return Buffer.from(data).toString('base64');

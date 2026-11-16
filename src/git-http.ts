@@ -6,7 +6,6 @@
 
 import { firstFlushOffset, parsePktLines, PKT_DELIM, PKT_FLUSH, pktLine, readPack, sidebandPack, writePack, type GitObject, type PktLine } from './gitcore.ts';
 import { isAuthorized, sendBytes, sendError, type Ctx } from './http.ts';
-import { parseTree, type ObjType } from './gitcore.ts';
 import type { Repo, Store } from './store.ts';
 import { ZERO_OID } from './util.ts';
 
@@ -232,7 +231,8 @@ function planFetch(store: Store, repo: Repo, args: FetchArgs): FetchPlan {
       if (object === undefined) continue;
       send.add(at);
       if (object.type === 'tree') {
-        for (const entry of parseTree(object.data)) stack.push(entry.oid);
+        const entries = store.readTree(repo, at);
+        if (entries !== null) for (const entry of entries) stack.push(entry.oid);
       }
     }
   }
@@ -367,9 +367,20 @@ function applyPush(store: Store, repo: Repo, commands: readonly PushCommand[]): 
   return report;
 }
 
-/** Whether the tip's whole closure (commits, trees, blobs) is in the store. */
+/**
+ * Whether the tip's whole closure (commits, trees, blobs) is in the store.
+ *
+ * Two caches keep this cheap on the push path: commits and trees are parsed
+ * once per repository (Store.readCommit/readTree), and commits whose closure
+ * was already verified are remembered on the repo (verifiedTips) — a push
+ * only ever adds objects, so a complete closure stays complete and the
+ * walk stops at the previous tip instead of re-walking the whole history.
+ * Only commits reached by a walk that completed are remembered; a failed
+ * walk remembers nothing.
+ */
 function closureComplete(store: Store, repo: Repo, tip: string): boolean {
   const seen = new Set<string>();
+  const visitedCommits: string[] = [];
   const stack = [tip];
   while (stack.length > 0) {
     const oid = stack.pop() as string;
@@ -378,17 +389,22 @@ function closureComplete(store: Store, repo: Repo, tip: string): boolean {
     const object = store.getObject(repo, oid);
     if (object === undefined) return false;
     if (object.type === 'commit') {
+      if (repo.verifiedTips.has(oid)) continue;
       const commit = store.readCommit(repo, oid);
       if (commit === null || !store.hasObject(repo, commit.tree)) return false;
+      visitedCommits.push(oid);
       for (const parent of commit.parents) stack.push(parent);
       stack.push(commit.tree);
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) stack.push(entry.oid);
+      const entries = store.readTree(repo, oid);
+      if (entries === null) return false;
+      for (const entry of entries) stack.push(entry.oid);
     } else if (object.type === 'tag') {
       const target = peelTag(object.data);
       if (target !== null) stack.push(target);
     }
   }
+  for (const oid of visitedCommits) repo.verifiedTips.add(oid);
   return true;
 }
 
@@ -492,8 +508,10 @@ export function handleGit(ctx: Ctx): boolean {
       if (hasPack) {
         const packBytes = ctx.body.subarray(flushAt);
         try {
-          const pack = readPack(new Uint8Array(packBytes), (oid) => ctx.store.getObject(repo, oid) ?? null);
-          for (const object of pack.objects) ctx.store.putObject(repo, object.type, object.data);
+          // packBytes is already a Buffer: readPack uses it as-is (no copy).
+          const pack = readPack(packBytes, (oid) => ctx.store.getObject(repo, oid) ?? null);
+          // readPack already hashed every entry: store by that oid instead of re-hashing.
+          for (const [oid, object] of pack.byOid) ctx.store.putObject(repo, object.type, object.data, oid);
         } catch (err) {
           report.unpackOk = false;
           report.unpackDetail = (err as Error).message;

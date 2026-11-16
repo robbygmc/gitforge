@@ -2,9 +2,8 @@
 // issues, comments and pull requests, in the shapes the suite's
 // checks-rest.ts asserts (see its header comment for the endpoint contract).
 
-import { b64decode, b64encode, isOid, VIEWER_ID, VIEWER_LOGIN, VIEWER_TYPE } from './util.ts';
+import { b64decode, b64encode, isoOfSeq, isOid, VIEWER_ID, VIEWER_LOGIN, VIEWER_TYPE } from './util.ts';
 import { isAuthorized, isRecord, parseJsonBody, sendError, sendJson, sendNoContent, type Ctx } from './http.ts';
-import { parseCommit, parseTree } from './gitcore.ts';
 import type { Issue, Label, Pull, Repo, Store } from './store.ts';
 
 // ---------------------------------------------------------------- rendering
@@ -14,7 +13,7 @@ export function userJson(): Record<string, unknown> {
 }
 
 export function repoJson(store: Store, repo: Repo): Record<string, unknown> {
-  const created = new Date((1_735_689_600 + repo.createdSeq) * 1000).toISOString();
+  const created = isoOfSeq(repo.createdSeq);
   return {
     id: repo.id,
     name: repo.name,
@@ -42,8 +41,8 @@ export function labelJson(label: Label): Record<string, unknown> {
 }
 
 export function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unknown> {
-  const created = new Date((1_735_689_600 + issue.createdSeq) * 1000).toISOString();
-  const updated = new Date((1_735_689_600 + issue.updatedSeq) * 1000).toISOString();
+  const created = isoOfSeq(issue.createdSeq);
+  const updated = isoOfSeq(issue.updatedSeq);
   return {
     id: issue.id,
     number: issue.number,
@@ -66,8 +65,8 @@ export function issueJson(store: Store, repo: Repo, issue: Issue): Record<string
 }
 
 export function pullJson(store: Store, repo: Repo, pull: Pull): Record<string, unknown> {
-  const created = new Date((1_735_689_600 + pull.createdSeq) * 1000).toISOString();
-  const updated = new Date((1_735_689_600 + pull.updatedSeq) * 1000).toISOString();
+  const created = isoOfSeq(pull.createdSeq);
+  const updated = isoOfSeq(pull.updatedSeq);
   const headTip = store.getRef(repo, store.refName(pull.headRef)) ?? pull.headSha;
   const baseTip = store.getRef(repo, store.refName(pull.baseRef)) ?? pull.baseSha;
   return {
@@ -102,7 +101,7 @@ export function pullMergeable(store: Store, repo: Repo, pull: Pull): boolean | n
 }
 
 export function commentJson(comment: { id: number; body: string; author: string; createdSeq: number }): Record<string, unknown> {
-  const created = new Date((1_735_689_600 + comment.createdSeq) * 1000).toISOString();
+  const created = isoOfSeq(comment.createdSeq);
   return {
     id: comment.id,
     body: comment.body,
@@ -612,16 +611,16 @@ function directoryEntries(store: Store, repo: Repo, treeOid: string, dirPath: st
   const segments = dirPath === '' ? [] : dirPath.split('/');
   let current = treeOid;
   for (const segment of segments) {
-    const object = store.getObject(repo, current);
-    if (object === undefined || object.type !== 'tree') return [];
-    const entry = parseTree(object.data).find((item) => item.name === segment && item.mode === '40000');
+    const entries = store.readTree(repo, current);
+    if (entries === null) return [];
+    const entry = entries.find((item) => item.name === segment && item.mode === '40000');
     if (entry === undefined) return [];
     current = entry.oid;
   }
-  const object = store.getObject(repo, current);
-  if (object === undefined || object.type !== 'tree') return [];
+  const entries = store.readTree(repo, current);
+  if (entries === null) return [];
   const out: Record<string, unknown>[] = [];
-  for (const entry of parseTree(object.data)) {
+  for (const entry of entries) {
     const entryPath = dirPath === '' ? entry.name : `${dirPath}/${entry.name}`;
     if (entry.mode === '40000') {
       out.push({ type: 'dir', name: entry.name, path: entryPath, sha: entry.oid });

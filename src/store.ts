@@ -4,7 +4,7 @@
 // merge, tree updates and diffs — live here so REST, GraphQL, MCP and the
 // smart-HTTP handlers all see one consistent state.
 
-import { buildCommit, buildTree, hashObject, parseCommit, parseTree, type GitObject, type ObjType, type TreeEntry } from './gitcore.ts';
+import { buildCommit, buildTree, hashObject, parseCommit, parseTree, type GitObject, type ObjType, type ParsedCommit, type TreeEntry } from './gitcore.ts';
 import { identityLine, TickClock, VIEWER_EMAIL, VIEWER_LOGIN, VIEWER_NAME } from './util.ts';
 
 export interface Comment {
@@ -66,6 +66,20 @@ export interface Repo {
   /** Issues and pull requests share one number sequence, as on GitHub. */
   nextNumber: number;
   nextCommentId: number;
+  /**
+   * Parsed commits and trees, cached by oid. Objects are immutable and
+   * append-only (only a whole-repo delete removes them), so a parsed form
+   * never goes stale; the closure walks re-parse the same commits and
+   * trees on every push and fetch without this cache.
+   */
+  commitCache: Map<string, ParsedCommit>;
+  treeCache: Map<string, TreeEntry[]>;
+  /**
+   * Commits whose whole closure was verified complete (see
+   * closureComplete in git-http.ts). A complete closure stays complete
+   * while objects are append-only, so later pushes stop their walk here.
+   */
+  verifiedTips: Set<string>;
 }
 
 /** A flattened tree: path -> blob oid (null means deleted in a merge result). */
@@ -113,6 +127,9 @@ export class Store {
       labels: [],
       nextNumber: 1,
       nextCommentId: 1,
+      commitCache: new Map(),
+      treeCache: new Map(),
+      verifiedTips: new Set(),
     };
     this.nextRepoId += 1;
     this.repos.set(key, repo);
@@ -137,10 +154,15 @@ export class Store {
 
   // ---------------------------------------------------------------- objects
 
-  putObject(repo: Repo, type: ObjType, data: Buffer): string {
-    const oid = hashObject(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
-    return oid;
+  /**
+   * Store an object, returning its oid. `oid` may be supplied when the
+   * caller already hashed the payload (a pack reader hashes every entry
+   * as it parses); it must be the object's true hash.
+   */
+  putObject(repo: Repo, type: ObjType, data: Buffer, oid?: string): string {
+    const id = oid ?? hashObject(type, data);
+    if (!repo.objects.has(id)) repo.objects.set(id, { type, data });
+    return id;
   }
 
   getObject(repo: Repo, oid: string): GitObject | undefined {
@@ -193,10 +215,25 @@ export class Store {
   }
 
   /** The parsed commit of an oid, or null when it is absent or not a commit. */
-  readCommit(repo: Repo, oid: string): ReturnType<typeof parseCommit> | null {
+  readCommit(repo: Repo, oid: string): ParsedCommit | null {
+    const cached = repo.commitCache.get(oid);
+    if (cached !== undefined) return cached;
     const object = repo.objects.get(oid);
     if (object === undefined || object.type !== 'commit') return null;
-    return parseCommit(object.data);
+    const parsed = parseCommit(object.data);
+    repo.commitCache.set(oid, parsed);
+    return parsed;
+  }
+
+  /** The parsed tree entries of an oid, or null when it is absent or not a tree. */
+  readTree(repo: Repo, oid: string): TreeEntry[] | null {
+    const cached = repo.treeCache.get(oid);
+    if (cached !== undefined) return cached;
+    const object = repo.objects.get(oid);
+    if (object === undefined || object.type !== 'tree') return null;
+    const parsed = parseTree(object.data);
+    repo.treeCache.set(oid, parsed);
+    return parsed;
   }
 
   /**
@@ -291,13 +328,15 @@ export class Store {
       if (object === undefined) continue;
       out.add(oid);
       if (object.type === 'commit') {
-        const commit = parseCommit(object.data);
+        const commit = this.readCommit(repo, oid);
+        if (commit === null) continue;
         queue.push(commit.tree);
         if (stopAt === undefined || !stopAt.has(oid)) {
           for (const parent of commit.parents) queue.push(parent);
         }
       } else if (object.type === 'tree') {
-        for (const entry of parseTree(object.data)) queue.push(entry.oid);
+        const entries = this.readTree(repo, oid);
+        if (entries !== null) for (const entry of entries) queue.push(entry.oid);
       } else if (object.type === 'tag') {
         // Tags in this forge are only ever created by pushes; peel them.
         const text = object.data.toString('utf8');
@@ -315,9 +354,9 @@ export class Store {
     const out = new Map<string, { oid: string; mode: string }>();
     if (treeOid === null) return out;
     const walk = (oid: string, prefix: string): void => {
-      const object = repo.objects.get(oid);
-      if (object === undefined || object.type !== 'tree') return;
-      for (const entry of parseTree(object.data)) {
+      const entries = this.readTree(repo, oid);
+      if (entries === null) return;
+      for (const entry of entries) {
         const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
         if (entry.mode === '40000') walk(entry.oid, path);
         else out.set(path, { oid: entry.oid, mode: entry.mode });
@@ -334,9 +373,9 @@ export class Store {
     const segments = path.split('/').filter((part) => part !== '');
     let treeOid = commit.tree;
     for (let i = 0; i < segments.length; i += 1) {
-      const object = repo.objects.get(treeOid);
-      if (object === undefined || object.type !== 'tree') return null;
-      const entry = parseTree(object.data).find((item) => item.name === segments[i]);
+      const entries = this.readTree(repo, treeOid);
+      if (entries === null) return null;
+      const entry = entries.find((item) => item.name === segments[i]);
       if (entry === undefined) return null;
       if (i === segments.length - 1) {
         if (entry.mode === '40000') return null;

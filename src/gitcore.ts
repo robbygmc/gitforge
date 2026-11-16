@@ -4,7 +4,7 @@
 // is built from. Standard library only (node:crypto, node:zlib).
 
 import { deflateSync, inflateSync } from 'node:zlib';
-import { sha1, ZERO_OID } from './util.ts';
+import { sha1, sha1Parts, ZERO_OID } from './util.ts';
 
 export type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
 
@@ -13,10 +13,9 @@ export interface GitObject {
   data: Buffer;
 }
 
-/** The object id of `type` + `data`: SHA-1 over `<type> <size>\0<data>`. */
+/** The object id of `type` + `data`: SHA-1 over `<type> <size>\0<data>` (hashed in two parts, no copy of the payload). */
 export function hashObject(type: ObjType, data: Buffer | Uint8Array): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1(Buffer.concat([header, Buffer.from(data)]));
+  return sha1Parts(`${type} ${data.length}\0`, data);
 }
 
 /** The canonical header bytes of an object, for hashing and storage. */
@@ -253,7 +252,9 @@ export interface PackReadResult {
  * is unknown. Verifies the trailer SHA-1 and every entry's inflated size.
  */
 export function readPack(pack: Uint8Array, resolveBase?: (oid: string) => GitObject | null): PackReadResult {
-  const buf = Buffer.from(pack);
+  // A Buffer input is used as-is (the receive-pack path hands over the
+  // request body); only a plain Uint8Array is copied into one.
+  const buf = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
   if (buf.length < 12 + 20) throw new PackError('packfile is too short for a header and trailer');
   if (buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new PackError('packfile does not start with PACK');
   const version = buf.readUInt32BE(4);

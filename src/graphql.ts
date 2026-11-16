@@ -4,7 +4,7 @@
 // enums, input objects, lists, __type/__schema introspection and batching
 // (a JSON array of operation documents in one request).
 
-import { b64urlDecode, b64urlEncode } from './util.ts';
+import { b64urlDecode, b64urlEncode, isoOfSeq } from './util.ts';
 import { isAuthorized, parseJsonBody, sendError, sendJson, type Ctx } from './http.ts';
 import type { Issue, Pull, Repo, Store } from './store.ts';
 import { createPullRecord, mergePullRecord, pullFiles, pullMergeable } from './rest.ts';
@@ -720,7 +720,7 @@ function resolveField(ctx: GqlContext, typeName: string, field: string, source: 
           found.pull.comments.push(comment);
           found.pull.updatedSeq = store.seq();
         }
-        const node = { __typename: 'Comment', id: commentGlobalId(repo, comment.id), body, createdAt: new Date((1_735_689_600 + comment.createdSeq) * 1000).toISOString() };
+        const node = { __typename: 'Comment', id: commentGlobalId(repo, comment.id), body, createdAt: isoOfSeq(comment.createdSeq) };
         return {
           value: { __typename: 'AddCommentPayload', commentEdge: { __typename: 'CommentEdge', node, cursor: cursorFor(0) } },
           typeName: 'AddCommentPayload',
@@ -788,7 +788,7 @@ function resolveField(ctx: GqlContext, typeName: string, field: string, source: 
       if (field === 'title') return { value: issue.title, typeName: null };
       if (field === 'state') return { value: issueState(issue), typeName: null };
       if (field === 'body') return { value: issue.body, typeName: null };
-      if (field === 'createdAt') return { value: new Date((1_735_689_600 + issue.createdSeq) * 1000).toISOString(), typeName: null };
+      if (field === 'createdAt') return { value: isoOfSeq(issue.createdSeq), typeName: null };
       if (field === 'labels') {
         const nodes = issue.labels.map((name) => ({ __typename: 'Label', name, color: 'ededed', description: '' }));
         return { value: connectionOf(nodes, args, 'Label'), typeName: 'LabelConnection' };
@@ -798,7 +798,7 @@ function resolveField(ctx: GqlContext, typeName: string, field: string, source: 
           __typename: 'Comment',
           id: commentGlobalId(repo, comment.id),
           body: comment.body,
-          createdAt: new Date((1_735_689_600 + comment.createdSeq) * 1000).toISOString(),
+          createdAt: isoOfSeq(comment.createdSeq),
         }));
         return { value: connectionOf(nodes, args, 'Comment'), typeName: 'CommentConnection' };
       }
@@ -819,7 +819,7 @@ function resolveField(ctx: GqlContext, typeName: string, field: string, source: 
         const mergeable = pullMergeable(store, repo, pull);
         return { value: mergeable === null ? 'UNKNOWN' : mergeable ? 'MERGEABLE' : 'CONFLICTING', typeName: null };
       }
-      if (field === 'createdAt') return { value: new Date((1_735_689_600 + pull.createdSeq) * 1000).toISOString(), typeName: null };
+      if (field === 'createdAt') return { value: isoOfSeq(pull.createdSeq), typeName: null };
       if (field === 'files') {
         const files = pullFiles(store, repo, pull).map((file) => ({
           __typename: 'PullRequestChangedFile',
