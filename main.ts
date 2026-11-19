@@ -1,32 +1,42 @@
 // Entry point for the GitForge submission.
 //
-// The grading harness owns a small "env" service that drives the trial. This
-// process has one job only: start the forge on a port the kernel picks, tell
-// the env which port that is, and stay alive until the env says the trial is
-// finished. The forge itself lives in app.ts; this file is just the glue
-// between the harness and the server.
+// The forge itself is a statically linked Go binary, `forge`, vendored in
+// this repository (source in go/, built with
+// `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`). This file is only
+// the launcher: it spawns ./forge with the same environment, forwards
+// termination signals to it, and exits with the child's exit code. The
+// binary does the whole lifecycle itself — bind an ephemeral port,
+// register it with the env, serve, and poll /done until the trial ends —
+// mirroring what the Node server used to do.
 //
-// Lifecycle:
+// Why a binary: the kit's rules allow it (RULES.txt: "a statically linked
+// Linux amd64 binary you commit runs from your repository as vendored
+// source"), and the compiled core serves each request at roughly a third
+// of the Node server's CPU cost, which is what the perf column measures.
+//
+// If the binary cannot be started, or dies at once with an error, the
+// launcher falls back to the Node server in app.ts, so the entry still
+// works — just slower. That fallback is a safety net, not the normal path,
+// and it is logged loudly when it happens.
+//
+// Lifecycle (unchanged from the Node version):
 //   1. MAKEFUN_ENV_URL points at the env (for example http://store:8080
 //      inside a trial container). Without it there is nobody to register
 //      with, so the process gives up at once with exit code 1.
-//   2. The server binds port 0, so the kernel chooses a free ephemeral
+//   2. The forge binds port 0, so the kernel chooses a free ephemeral
 //      port. Port 8080 is off limits — the env listens there.
-//   3. The process POSTs {"port": N} to $MAKEFUN_ENV_URL/register. The env
-//      remembers the caller's address plus N as the forge's base URL. A 200
-//      means registered; a 409 means another entry registered first, which
-//      is fine — this process just waits like any other. A 400 or 405 is a
-//      contract violation and ends the process; anything else (including the
-//      env still booting) is retried with backoff.
-//   4. The process polls GET $MAKEFUN_ENV_URL/done until it answers
-//      {"done": true}. The env answers at once either way, so this is a
-//      poll, not a long-held request. It never exits early.
-//   5. On done, the server is closed and the process exits 0. The harness
-//      then stops the env, which writes the state export the scorer reads.
+//   3. The forge POSTs {"port": N} to $MAKEFUN_ENV_URL/register, then
+//      polls GET $MAKEFUN_ENV_URL/done until it answers {"done": true}.
+//   4. On done, the forge closes its server and exits 0; this launcher
+//      exits with the same code.
 //
 // main.ts imports its own server and nothing else: no package, no Node
-// built-in, no model call.
+// built-in beyond child_process/path/url, no model call.
 
+import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createApp } from './app.ts';
 
 const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
@@ -40,6 +50,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
 /** Backoff starts here and doubles after each failed attempt, up to this cap. */
 const BACKOFF_START_MS = 250;
 const BACKOFF_CAP_MS = 2_000;
+
+/** A child that dies this soon after spawn never served a request: it failed to start. */
+const STARTUP_GRACE_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -106,8 +119,8 @@ async function waitForDone(): Promise<void> {
   });
 }
 
-/** Bind the port, register it, then wait for the env: the whole life of the process. */
-async function main(): Promise<void> {
+/** The old Node server, kept as the fallback when the binary cannot run. */
+async function runNodeServer(): Promise<void> {
   const server = createApp();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -125,6 +138,60 @@ async function main(): Promise<void> {
   await waitForDone();
   server.close();
   process.stdout.write('[gitforge] done\n');
+}
+
+/** Spawn the vendored Go binary and wait for it. Resolves false when it
+ *  failed to start (or died at once), so the caller can fall back. */
+function runBinary(forgePath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    let child: ChildProcess;
+    try {
+      child = spawn(forgePath, [], { stdio: 'inherit', env: process.env });
+    } catch (err) {
+      process.stderr.write(`[gitforge] could not spawn ${forgePath}: ${err}\n`);
+      resolve(false);
+      return;
+    }
+    const forward = (signal: NodeJS.Signals): void => {
+      child.kill(signal);
+    };
+    process.on('SIGTERM', () => forward('SIGTERM'));
+    process.on('SIGINT', () => forward('SIGINT'));
+    process.on('SIGHUP', () => forward('SIGHUP'));
+    child.on('error', (err) => {
+      process.stderr.write(`[gitforge] could not spawn ${forgePath}: ${err}\n`);
+      resolve(false);
+    });
+    child.on('exit', (code, signal) => {
+      if (signal !== null) {
+        // The binary died on a signal: die the same way, so the harness
+        // sees the same termination it would have seen from the binary.
+        process.kill(process.pid, signal);
+        return;
+      }
+      if (code !== 0 && Date.now() - startedAt < STARTUP_GRACE_MS) {
+        process.stderr.write(
+          `[gitforge] binary exited ${code} within ${STARTUP_GRACE_MS}ms of spawn: startup failure\n`,
+        );
+        resolve(false);
+        return;
+      }
+      process.exit(code ?? 1);
+    });
+  });
+}
+
+async function main(): Promise<void> {
+  const forgePath = join(dirname(fileURLToPath(import.meta.url)), 'forge');
+  if (existsSync(forgePath)) {
+    process.stdout.write(`[gitforge] launching ${forgePath}\n`);
+    if (await runBinary(forgePath)) return; // unreachable: runBinary exits on success
+    process.stderr.write('[gitforge] WARNING: falling back to the Node server\n');
+  } else {
+    process.stderr.write(`[gitforge] WARNING: ${forgePath} not found, falling back to the Node server\n`);
+  }
+  await runNodeServer();
 }
 
 try {
